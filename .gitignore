@@ -1,0 +1,16 @@
+# Go binaries / artifacts
+*.exe
+*.test
+*.out
+coverage.txt
+
+# IDE
+.idea/
+.vscode/
+
+# OS
+.DS_Store
+
+# Local env
+.env
+.env.local
