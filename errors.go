@@ -70,6 +70,8 @@ var (
 // the IdP silently returns 204 in both cases to avoid leaking configuration.
 // Compare with errors.Is.
 var (
-	ErrAppInactive            = errors.New("tzam: application is inactive")
-	ErrPasswordMethodDisabled = errors.New("tzam: email/password authentication is disabled for this client_id")
+	ErrAppInactive             = errors.New("tzam: application is inactive")
+	ErrPasswordMethodDisabled  = errors.New("tzam: email/password authentication is disabled for this client_id")
+	ErrMagicLinkMethodDisabled = errors.New("tzam: magic-link authentication is disabled for this client_id")
+	ErrOtpMethodDisabled       = errors.New("tzam: OTP authentication is disabled for this client_id")
 )

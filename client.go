@@ -116,8 +116,20 @@ func (c *Client) Logout(ctx context.Context, accessToken, refreshToken string) e
 }
 
 // RequestMagicLink asks the IdP to email a one-time login link to the user.
-// Returns nil on 200 and 204.
+// Probes /auth/app-config first and returns ErrAppInactive /
+// ErrMagicLinkMethodDisabled when the flow would be silently dropped —
+// turning the IdP's 204-anyway contract into an actionable error.
 func (c *Client) RequestMagicLink(ctx context.Context, email, redirect string) error {
+	cfg, err := c.GetAuthMethods(ctx)
+	if err != nil {
+		return err
+	}
+	if !cfg.Active {
+		return ErrAppInactive
+	}
+	if !cfg.Methods.MagicLink {
+		return ErrMagicLinkMethodDisabled
+	}
 	body := map[string]any{
 		"email":     email,
 		"redirect":  redirect,
@@ -126,8 +138,20 @@ func (c *Client) RequestMagicLink(ctx context.Context, email, redirect string) e
 	return c.post(ctx, "/auth/magic-link", body, nil, nil)
 }
 
-// RequestOTP sends a one-time numeric code to the user's email.
+// RequestOTP sends a one-time numeric code to the user's email. Probes
+// /auth/app-config first and returns ErrAppInactive / ErrOtpMethodDisabled
+// when the flow would be silently dropped.
 func (c *Client) RequestOTP(ctx context.Context, email string) error {
+	cfg, err := c.GetAuthMethods(ctx)
+	if err != nil {
+		return err
+	}
+	if !cfg.Active {
+		return ErrAppInactive
+	}
+	if !cfg.Methods.OTP {
+		return ErrOtpMethodDisabled
+	}
 	body := map[string]any{
 		"email":     email,
 		"client_id": c.cfg.ClientID,

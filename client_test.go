@@ -268,6 +268,100 @@ func TestForgotPassword_FailsFastWhenPasswordMethodDisabled(t *testing.T) {
 	}
 }
 
+func TestRequestMagicLink_ProbesAppConfigThenPosts(t *testing.T) {
+	srv := newMockServer(t, func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/auth/app-config" {
+			_ = json.NewEncoder(w).Encode(AppConfig{
+				ClientID: "cid",
+				Active:   true,
+				Methods:  AppMethods{MagicLink: true},
+			})
+			return
+		}
+		w.WriteHeader(http.StatusNoContent)
+	})
+	c := NewClient(Config{URL: srv.URL, ClientID: "cid"})
+
+	if err := c.RequestMagicLink(context.Background(), "u@x", "/after"); err != nil {
+		t.Fatalf("RequestMagicLink returned error: %v", err)
+	}
+	if srv.last.path != "/auth/magic-link" || srv.last.method != http.MethodPost {
+		t.Errorf("last request should be POST /auth/magic-link, got %+v", srv.last)
+	}
+}
+
+func TestRequestMagicLink_FailsFastWhenDisabled(t *testing.T) {
+	hit := 0
+	srv := newMockServer(t, func(w http.ResponseWriter, r *http.Request) {
+		hit++
+		if r.URL.Path == "/auth/app-config" {
+			_ = json.NewEncoder(w).Encode(AppConfig{
+				ClientID: "cid",
+				Active:   true,
+				Methods:  AppMethods{MagicLink: false},
+			})
+			return
+		}
+		w.WriteHeader(http.StatusNoContent)
+	})
+	c := NewClient(Config{URL: srv.URL, ClientID: "cid"})
+
+	err := c.RequestMagicLink(context.Background(), "u@x", "")
+	if !errors.Is(err, ErrMagicLinkMethodDisabled) {
+		t.Fatalf("expected ErrMagicLinkMethodDisabled, got %v", err)
+	}
+	if hit != 1 {
+		t.Fatalf("magic-link endpoint must not be hit when disabled; hit=%d", hit)
+	}
+}
+
+func TestRequestOTP_ProbesAppConfigThenPosts(t *testing.T) {
+	srv := newMockServer(t, func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/auth/app-config" {
+			_ = json.NewEncoder(w).Encode(AppConfig{
+				ClientID: "cid",
+				Active:   true,
+				Methods:  AppMethods{OTP: true},
+			})
+			return
+		}
+		w.WriteHeader(http.StatusNoContent)
+	})
+	c := NewClient(Config{URL: srv.URL, ClientID: "cid"})
+
+	if err := c.RequestOTP(context.Background(), "u@x"); err != nil {
+		t.Fatalf("RequestOTP returned error: %v", err)
+	}
+	if srv.last.path != "/auth/otp" || srv.last.method != http.MethodPost {
+		t.Errorf("last request should be POST /auth/otp, got %+v", srv.last)
+	}
+}
+
+func TestRequestOTP_FailsFastWhenDisabled(t *testing.T) {
+	hit := 0
+	srv := newMockServer(t, func(w http.ResponseWriter, r *http.Request) {
+		hit++
+		if r.URL.Path == "/auth/app-config" {
+			_ = json.NewEncoder(w).Encode(AppConfig{
+				ClientID: "cid",
+				Active:   true,
+				Methods:  AppMethods{OTP: false},
+			})
+			return
+		}
+		w.WriteHeader(http.StatusNoContent)
+	})
+	c := NewClient(Config{URL: srv.URL, ClientID: "cid"})
+
+	err := c.RequestOTP(context.Background(), "u@x")
+	if !errors.Is(err, ErrOtpMethodDisabled) {
+		t.Fatalf("expected ErrOtpMethodDisabled, got %v", err)
+	}
+	if hit != 1 {
+		t.Fatalf("otp endpoint must not be hit when disabled; hit=%d", hit)
+	}
+}
+
 func TestForgotPassword_FailsFastWhenAppInactive(t *testing.T) {
 	hit := 0
 	srv := newMockServer(t, func(w http.ResponseWriter, r *http.Request) {
