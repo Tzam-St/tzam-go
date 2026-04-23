@@ -180,3 +180,77 @@ func TestNewClient_PanicsOnMissingURL(t *testing.T) {
 	}()
 	NewClient(Config{})
 }
+
+func TestForgotPassword_PostsEmailAndClientID(t *testing.T) {
+	srv := newMockServer(t, func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusNoContent)
+	})
+	c := NewClient(Config{URL: srv.URL, ClientID: "cid"})
+
+	if err := c.ForgotPassword(context.Background(), "user@example.com"); err != nil {
+		t.Fatalf("ForgotPassword returned error: %v", err)
+	}
+	if srv.last.path != "/auth/forgot-password" || srv.last.method != http.MethodPost {
+		t.Errorf("wrong request: %+v", srv.last)
+	}
+	if srv.last.body["email"] != "user@example.com" {
+		t.Errorf("missing email in body: %+v", srv.last.body)
+	}
+	if srv.last.body["clientId"] != "cid" {
+		t.Errorf("missing clientId in body: %+v", srv.last.body)
+	}
+}
+
+func TestForgotPassword_NoLeakOnUnknownEmail(t *testing.T) {
+	srv := newMockServer(t, func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusNoContent) // server returns 204 even when email unknown
+	})
+	c := NewClient(Config{URL: srv.URL})
+
+	if err := c.ForgotPassword(context.Background(), "ghost@example.com"); err != nil {
+		t.Fatalf("204 should be treated as success, got %v", err)
+	}
+}
+
+func TestForgotPassword_PropagatesServerError(t *testing.T) {
+	srv := newMockServer(t, func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusInternalServerError)
+		_ = json.NewEncoder(w).Encode(map[string]string{"message": "Mail provider unavailable"})
+	})
+	c := NewClient(Config{URL: srv.URL})
+
+	err := c.ForgotPassword(context.Background(), "u@x")
+	if err == nil {
+		t.Fatal("expected error on 500, got nil")
+	}
+}
+
+func TestResetPassword_PostsTokenAndPassword(t *testing.T) {
+	srv := newMockServer(t, func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusNoContent)
+	})
+	c := NewClient(Config{URL: srv.URL})
+
+	if err := c.ResetPassword(context.Background(), "tok-xxx", "NewSecret123!"); err != nil {
+		t.Fatalf("ResetPassword returned error: %v", err)
+	}
+	if srv.last.path != "/auth/reset-password" {
+		t.Errorf("wrong path: %s", srv.last.path)
+	}
+	if srv.last.body["token"] != "tok-xxx" || srv.last.body["newPassword"] != "NewSecret123!" {
+		t.Errorf("missing fields in body: %+v", srv.last.body)
+	}
+}
+
+func TestResetPassword_RejectsExpiredToken(t *testing.T) {
+	srv := newMockServer(t, func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusUnauthorized)
+		_ = json.NewEncoder(w).Encode(map[string]string{"message": "Invalid or expired reset token"})
+	})
+	c := NewClient(Config{URL: srv.URL})
+
+	err := c.ResetPassword(context.Background(), "bad", "NewPass1!")
+	if err == nil {
+		t.Fatal("expected error on expired token, got nil")
+	}
+}

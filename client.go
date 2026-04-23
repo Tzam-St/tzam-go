@@ -152,6 +152,29 @@ func (c *Client) MagicLinkVerifyURL(token string) string {
 	return c.cfg.URL + "/auth/magic-link/verify?token=" + url.QueryEscape(token)
 }
 
+// ForgotPassword asks the IdP to email a password-reset link to the user.
+// The IdP routes the email through the calling app's organization-scoped
+// email provider when ClientID is configured (per-org branding, custom
+// from-address). Server intentionally returns 204 even when the email is
+// unknown — never reveals whether an account exists.
+func (c *Client) ForgotPassword(ctx context.Context, email string) error {
+	body := map[string]any{
+		"email":    email,
+		"clientId": c.cfg.ClientID,
+	}
+	return c.post(ctx, "/auth/forgot-password", body, nil, nil)
+}
+
+// ResetPassword completes a password change using the token delivered by
+// ForgotPassword. Returns nil on success; an error on invalid/expired token.
+func (c *Client) ResetPassword(ctx context.Context, token, newPassword string) error {
+	body := map[string]any{
+		"token":       token,
+		"newPassword": newPassword,
+	}
+	return c.post(ctx, "/auth/reset-password", body, nil, nil)
+}
+
 // ─── internals ───────────────────────────────────────────────────────
 
 func (c *Client) post(ctx context.Context, path string, body any, headers http.Header, out any) error {
