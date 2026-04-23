@@ -254,3 +254,79 @@ func TestResetPassword_RejectsExpiredToken(t *testing.T) {
 		t.Fatal("expected error on expired token, got nil")
 	}
 }
+
+// GetAuthMethods is the client-side half of the silent-by-design
+// forgot-password flow: since /auth/forgot-password always returns 204
+// (even when the app has password auth disabled) to avoid leaking which
+// methods an app exposes, callers must consult /auth/app-config to
+// decide what UI to render.
+func TestGetAuthMethods_GETsAppConfigWithClientID(t *testing.T) {
+	var gotQuery string
+	srv := newMockServer(t, func(w http.ResponseWriter, r *http.Request) {
+		gotQuery = r.URL.RawQuery
+		_ = json.NewEncoder(w).Encode(AppConfig{
+			ClientID: "cid-1",
+			Active:   true,
+			Methods: AppMethods{
+				Password:  true,
+				MagicLink: false,
+				OTP:       false,
+				OAuth:     OAuthMethods{Github: false, Google: true},
+			},
+		})
+	})
+	c := NewClient(Config{URL: srv.URL, ClientID: "cid-1"})
+
+	cfg, err := c.GetAuthMethods(context.Background())
+	if err != nil {
+		t.Fatalf("GetAuthMethods returned error: %v", err)
+	}
+	if srv.last.path != "/auth/app-config" || srv.last.method != http.MethodGet {
+		t.Errorf("wrong request: %+v", srv.last)
+	}
+	if gotQuery != "client_id=cid-1" {
+		t.Errorf("expected query client_id=cid-1, got %q", gotQuery)
+	}
+	if !cfg.Active || !cfg.Methods.Password || !cfg.Methods.OAuth.Google {
+		t.Errorf("unexpected decoded config: %+v", cfg)
+	}
+}
+
+func TestGetAuthMethods_ReturnsInactiveWhenServerSaysSo(t *testing.T) {
+	srv := newMockServer(t, func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"clientId": "unknown",
+			"active":   false,
+			"methods": map[string]any{
+				"password":  false,
+				"magicLink": false,
+				"otp":       false,
+				"oauth":     map[string]bool{"github": false, "google": false},
+			},
+		})
+	})
+	c := NewClient(Config{URL: srv.URL, ClientID: "unknown"})
+
+	cfg, err := c.GetAuthMethods(context.Background())
+	if err != nil {
+		t.Fatalf("GetAuthMethods returned error: %v", err)
+	}
+	if cfg.Active {
+		t.Errorf("expected Active=false, got true")
+	}
+	if cfg.Methods.Password || cfg.Methods.MagicLink || cfg.Methods.OAuth.Google {
+		t.Errorf("expected all methods false, got %+v", cfg.Methods)
+	}
+}
+
+func TestGetAuthMethods_PropagatesServerError(t *testing.T) {
+	srv := newMockServer(t, func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusInternalServerError)
+		_ = json.NewEncoder(w).Encode(map[string]string{"message": "Upstream unavailable"})
+	})
+	c := NewClient(Config{URL: srv.URL, ClientID: "cid"})
+
+	if _, err := c.GetAuthMethods(context.Background()); err == nil {
+		t.Fatal("expected error on 500, got nil")
+	}
+}

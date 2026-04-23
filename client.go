@@ -175,7 +175,48 @@ func (c *Client) ResetPassword(ctx context.Context, token, newPassword string) e
 	return c.post(ctx, "/auth/reset-password", body, nil, nil)
 }
 
+// GetAuthMethods probes which auth methods are currently enabled for the
+// configured ClientID. Use this to decide what UI to render —
+// ForgotPassword (and other silent auth-email flows) always return 204,
+// even when the method is disabled for the app, to avoid leaking which
+// methods the app exposes. This endpoint is the only non-leaky way to
+// find out.
+func (c *Client) GetAuthMethods(ctx context.Context) (*AppConfig, error) {
+	path := "/auth/app-config?client_id=" + url.QueryEscape(c.cfg.ClientID)
+	var out AppConfig
+	if err := c.get(ctx, path, &out); err != nil {
+		return nil, err
+	}
+	return &out, nil
+}
+
 // ─── internals ───────────────────────────────────────────────────────
+
+func (c *Client) get(ctx context.Context, path string, out any) error {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.cfg.URL+path, nil)
+	if err != nil {
+		return fmt.Errorf("tzam: build request: %w", err)
+	}
+	req.Header.Set("Accept", "application/json")
+
+	resp, err := c.http.Do(req)
+	if err != nil {
+		return fmt.Errorf("tzam: %s %s: %w", http.MethodGet, path, err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode >= 400 {
+		return decodeAPIError(resp)
+	}
+
+	if out == nil || resp.StatusCode == http.StatusNoContent {
+		return nil
+	}
+	if err := json.NewDecoder(resp.Body).Decode(out); err != nil {
+		return fmt.Errorf("tzam: decode response: %w", err)
+	}
+	return nil
+}
 
 func (c *Client) post(ctx context.Context, path string, body any, headers http.Header, out any) error {
 	var rdr io.Reader

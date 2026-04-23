@@ -47,3 +47,28 @@ type TokenPayload struct {
 	UserID string `json:"userId"`
 	Email  string `json:"email"`
 }
+
+// OAuthMethods tells which third-party login buttons are currently enabled
+// for the calling app.
+type OAuthMethods struct {
+	Github bool `json:"github"`
+	Google bool `json:"google"`
+}
+
+// AppMethods describes which auth entry points are active for the app.
+type AppMethods struct {
+	Password  bool         `json:"password"`
+	MagicLink bool         `json:"magicLink"`
+	OTP       bool         `json:"otp"`
+	OAuth     OAuthMethods `json:"oauth"`
+}
+
+// AppConfig is returned by GetAuthMethods. It lets the client decide
+// what auth UI to render without relying on forgot-password / magic-link
+// status codes — those endpoints are silent by design so they can't be
+// probed to enumerate which methods an app exposes.
+type AppConfig struct {
+	ClientID string     `json:"clientId"`
+	Active   bool       `json:"active"`
+	Methods  AppMethods `json:"methods"`
+}
