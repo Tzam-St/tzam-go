@@ -181,17 +181,35 @@ func TestNewClient_PanicsOnMissingURL(t *testing.T) {
 	NewClient(Config{})
 }
 
-func TestForgotPassword_PostsEmailAndClientID(t *testing.T) {
-	srv := newMockServer(t, func(w http.ResponseWriter, r *http.Request) {
+// appConfigHandler returns a handler that serves GET /auth/app-config with
+// the given overrides. Any other path is delegated to fallback.
+func appConfigHandler(active, password bool, fallback http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/auth/app-config" {
+			_ = json.NewEncoder(w).Encode(AppConfig{
+				ClientID: "cid",
+				Active:   active,
+				Methods:  AppMethods{Password: password},
+			})
+			return
+		}
+		if fallback != nil {
+			fallback(w, r)
+		}
+	}
+}
+
+func TestForgotPassword_ProbesAppConfigThenPosts(t *testing.T) {
+	srv := newMockServer(t, appConfigHandler(true, true, func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusNoContent)
-	})
+	}))
 	c := NewClient(Config{URL: srv.URL, ClientID: "cid"})
 
 	if err := c.ForgotPassword(context.Background(), "user@example.com"); err != nil {
 		t.Fatalf("ForgotPassword returned error: %v", err)
 	}
 	if srv.last.path != "/auth/forgot-password" || srv.last.method != http.MethodPost {
-		t.Errorf("wrong request: %+v", srv.last)
+		t.Errorf("last request should be POST /auth/forgot-password, got %+v", srv.last)
 	}
 	if srv.last.body["email"] != "user@example.com" {
 		t.Errorf("missing email in body: %+v", srv.last.body)
@@ -202,10 +220,10 @@ func TestForgotPassword_PostsEmailAndClientID(t *testing.T) {
 }
 
 func TestForgotPassword_NoLeakOnUnknownEmail(t *testing.T) {
-	srv := newMockServer(t, func(w http.ResponseWriter, r *http.Request) {
+	srv := newMockServer(t, appConfigHandler(true, true, func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusNoContent) // server returns 204 even when email unknown
-	})
-	c := NewClient(Config{URL: srv.URL})
+	}))
+	c := NewClient(Config{URL: srv.URL, ClientID: "cid"})
 
 	if err := c.ForgotPassword(context.Background(), "ghost@example.com"); err != nil {
 		t.Fatalf("204 should be treated as success, got %v", err)
@@ -213,15 +231,65 @@ func TestForgotPassword_NoLeakOnUnknownEmail(t *testing.T) {
 }
 
 func TestForgotPassword_PropagatesServerError(t *testing.T) {
-	srv := newMockServer(t, func(w http.ResponseWriter, r *http.Request) {
+	srv := newMockServer(t, appConfigHandler(true, true, func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusInternalServerError)
 		_ = json.NewEncoder(w).Encode(map[string]string{"message": "Mail provider unavailable"})
-	})
-	c := NewClient(Config{URL: srv.URL})
+	}))
+	c := NewClient(Config{URL: srv.URL, ClientID: "cid"})
 
 	err := c.ForgotPassword(context.Background(), "u@x")
 	if err == nil {
 		t.Fatal("expected error on 500, got nil")
+	}
+}
+
+func TestForgotPassword_FailsFastWhenPasswordMethodDisabled(t *testing.T) {
+	hit := 0
+	srv := newMockServer(t, func(w http.ResponseWriter, r *http.Request) {
+		hit++
+		if r.URL.Path == "/auth/app-config" {
+			_ = json.NewEncoder(w).Encode(AppConfig{
+				ClientID: "cid",
+				Active:   true,
+				Methods:  AppMethods{Password: false},
+			})
+			return
+		}
+		w.WriteHeader(http.StatusNoContent)
+	})
+	c := NewClient(Config{URL: srv.URL, ClientID: "cid"})
+
+	err := c.ForgotPassword(context.Background(), "u@x")
+	if !errors.Is(err, ErrPasswordMethodDisabled) {
+		t.Fatalf("expected ErrPasswordMethodDisabled, got %v", err)
+	}
+	if hit != 1 {
+		t.Fatalf("forgot-password endpoint must not be hit when disabled; hit=%d", hit)
+	}
+}
+
+func TestForgotPassword_FailsFastWhenAppInactive(t *testing.T) {
+	hit := 0
+	srv := newMockServer(t, func(w http.ResponseWriter, r *http.Request) {
+		hit++
+		if r.URL.Path == "/auth/app-config" {
+			_ = json.NewEncoder(w).Encode(AppConfig{
+				ClientID: "cid",
+				Active:   false,
+				Methods:  AppMethods{Password: true},
+			})
+			return
+		}
+		w.WriteHeader(http.StatusNoContent)
+	})
+	c := NewClient(Config{URL: srv.URL, ClientID: "cid"})
+
+	err := c.ForgotPassword(context.Background(), "u@x")
+	if !errors.Is(err, ErrAppInactive) {
+		t.Fatalf("expected ErrAppInactive, got %v", err)
+	}
+	if hit != 1 {
+		t.Fatalf("forgot-password endpoint must not be hit when inactive; hit=%d", hit)
 	}
 }
 

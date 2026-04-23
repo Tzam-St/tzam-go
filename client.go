@@ -157,7 +157,23 @@ func (c *Client) MagicLinkVerifyURL(token string) string {
 // email provider when ClientID is configured (per-org branding, custom
 // from-address). Server intentionally returns 204 even when the email is
 // unknown — never reveals whether an account exists.
+//
+// Because the IdP also returns 204 when the app is inactive or has the
+// email/password method disabled, this method probes /auth/app-config
+// first and returns ErrAppInactive / ErrPasswordMethodDisabled before
+// hitting the endpoint — so consumers get an actionable error instead
+// of a silent no-op.
 func (c *Client) ForgotPassword(ctx context.Context, email string) error {
+	cfg, err := c.GetAuthMethods(ctx)
+	if err != nil {
+		return err
+	}
+	if !cfg.Active {
+		return ErrAppInactive
+	}
+	if !cfg.Methods.Password {
+		return ErrPasswordMethodDisabled
+	}
 	body := map[string]any{
 		"email":    email,
 		"clientId": c.cfg.ClientID,

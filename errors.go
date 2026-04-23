@@ -64,3 +64,12 @@ var (
 	ErrSessionRevoked     = &APIError{Code: CodeAuthSessionRevoked}
 	ErrRefreshFailed      = &APIError{Code: CodeAuthRefreshFailed}
 )
+
+// Client-side sentinels raised by ForgotPassword when the /auth/app-config
+// probe shows the flow cannot succeed. These are NOT returned by the IdP —
+// the IdP silently returns 204 in both cases to avoid leaking configuration.
+// Compare with errors.Is.
+var (
+	ErrAppInactive            = errors.New("tzam: application is inactive")
+	ErrPasswordMethodDisabled = errors.New("tzam: email/password authentication is disabled for this client_id")
+)
