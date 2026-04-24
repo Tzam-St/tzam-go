@@ -40,6 +40,11 @@ func NewClient(cfg Config) *Client {
 }
 
 // Login exchanges email + password for access and refresh tokens.
+//
+// Merges Set-Cookie values (access_token / refresh_token) into the result
+// when the body field is empty — the Tzam IdP intentionally omits
+// refresh_token from the body (cookie-only) but older/alternative backends
+// may ship both. Body values win when both are present.
 func (c *Client) Login(ctx context.Context, email, password string) (*LoginResult, error) {
 	body := map[string]any{
 		"email":         email,
@@ -47,14 +52,11 @@ func (c *Client) Login(ctx context.Context, email, password string) (*LoginResul
 		"client_id":     c.cfg.ClientID,
 		"client_secret": c.cfg.ClientSecret,
 	}
-	var out LoginResult
-	if err := c.post(ctx, "/auth/login", body, nil, &out); err != nil {
-		return nil, err
-	}
-	return &out, nil
+	return c.postLoginShape(ctx, "/auth/login", body)
 }
 
 // Register creates a new app-scoped user and logs them in.
+// Same cookie-merge contract as Login.
 func (c *Client) Register(ctx context.Context, name, email, password string) (*LoginResult, error) {
 	body := map[string]any{
 		"name":         name,
@@ -63,10 +65,24 @@ func (c *Client) Register(ctx context.Context, name, email, password string) (*L
 		"clientId":     c.cfg.ClientID,
 		"clientSecret": c.cfg.ClientSecret,
 	}
-	var out LoginResult
-	if err := c.post(ctx, "/auth/register/app", body, nil, &out); err != nil {
+	return c.postLoginShape(ctx, "/auth/register/app", body)
+}
+
+func (c *Client) postLoginShape(ctx context.Context, path string, body any) (*LoginResult, error) {
+	status, data, cookies, err := c.postRaw(ctx, path, body, nil)
+	if err != nil {
 		return nil, err
 	}
+	if status >= 400 {
+		return nil, decodeAPIErrorFromBytes(status, data)
+	}
+	var out LoginResult
+	if len(data) > 0 {
+		if err := json.Unmarshal(data, &out); err != nil {
+			return nil, fmt.Errorf("tzam: decode response: %w", err)
+		}
+	}
+	mergeTokenCookies(&out.AccessToken, &out.RefreshToken, cookies)
 	return &out, nil
 }
 
@@ -90,19 +106,56 @@ func (c *Client) ValidateToken(ctx context.Context, token string) (*TokenPayload
 	return &out, nil
 }
 
-// RefreshToken swaps a refresh token for a new access token. The refresh
-// token itself is sent in a Cookie header to match how browsers do it.
-func (c *Client) RefreshToken(ctx context.Context, refreshToken string) (string, error) {
+// RefreshSession swaps a refresh token for a fresh access (and possibly
+// rotated refresh) token.
+//
+// Reads both tokens from the response body AND from Set-Cookie headers —
+// works transparently against legacy body-only backends and modern
+// cookie-only Tzam backends.
+//
+// RefreshResult.RefreshToken is non-empty only when the server rotated
+// it. Callers relaying cookies to a browser should rewrite the refresh
+// cookie only when it's non-empty and differs from the one they sent
+// (see Proxy.Wrap for the canonical pattern).
+func (c *Client) RefreshSession(ctx context.Context, refreshToken string) (*RefreshResult, error) {
 	headers := http.Header{
 		"Cookie": {"refresh_token=" + refreshToken},
 	}
-	var out struct {
-		AccessToken string `json:"accessToken"`
+	status, data, cookies, err := c.postRaw(ctx, "/auth/refresh", nil, headers)
+	if err != nil {
+		return nil, err
 	}
-	if err := c.post(ctx, "/auth/refresh", nil, headers, &out); err != nil {
+	if status >= 400 {
+		return nil, decodeAPIErrorFromBytes(status, data)
+	}
+	var body struct {
+		AccessToken  string `json:"accessToken"`
+		RefreshToken string `json:"refreshToken"`
+	}
+	if len(data) > 0 {
+		_ = json.Unmarshal(data, &body)
+	}
+	out := &RefreshResult{
+		AccessToken:  body.AccessToken,
+		RefreshToken: body.RefreshToken,
+	}
+	mergeTokenCookies(&out.AccessToken, &out.RefreshToken, cookies)
+	return out, nil
+}
+
+// RefreshToken swaps a refresh token for a new access token.
+//
+// Deprecated: use RefreshSession instead. RefreshToken discards any
+// rotated refresh token the server may have issued, which breaks
+// rotating-refresh Tzam backends — the browser ends up keeping a
+// consumed refresh and the next refresh call fails with 401. Retained
+// for backward compatibility with callers pinned to v0.4.x.
+func (c *Client) RefreshToken(ctx context.Context, refreshToken string) (string, error) {
+	res, err := c.RefreshSession(ctx, refreshToken)
+	if err != nil {
 		return "", err
 	}
-	return out.AccessToken, nil
+	return res.AccessToken, nil
 }
 
 // Logout revokes the session tied to refreshToken. Best-effort — any error
@@ -246,7 +299,8 @@ func (c *Client) get(ctx context.Context, path string, out any) error {
 	defer resp.Body.Close()
 
 	if resp.StatusCode >= 400 {
-		return decodeAPIError(resp)
+		data, _ := io.ReadAll(resp.Body)
+		return decodeAPIErrorFromBytes(resp.StatusCode, data)
 	}
 
 	if out == nil || resp.StatusCode == http.StatusNoContent {
@@ -259,18 +313,39 @@ func (c *Client) get(ctx context.Context, path string, out any) error {
 }
 
 func (c *Client) post(ctx context.Context, path string, body any, headers http.Header, out any) error {
+	status, data, _, err := c.postRaw(ctx, path, body, headers)
+	if err != nil {
+		return err
+	}
+	if status >= 400 {
+		return decodeAPIErrorFromBytes(status, data)
+	}
+	if out == nil || status == http.StatusNoContent {
+		return nil
+	}
+	if err := json.Unmarshal(data, out); err != nil {
+		return fmt.Errorf("tzam: decode response: %w", err)
+	}
+	return nil
+}
+
+// postRaw issues a POST and returns the status, body bytes, and response
+// Set-Cookie values. The body is fully drained and closed. Callers that
+// only need a JSON payload use post; callers that also need to inspect
+// Set-Cookie (Login / Register / RefreshSession) use this directly.
+func (c *Client) postRaw(ctx context.Context, path string, body any, headers http.Header) (int, []byte, []*http.Cookie, error) {
 	var rdr io.Reader
 	if body != nil {
 		b, err := json.Marshal(body)
 		if err != nil {
-			return fmt.Errorf("tzam: marshal request: %w", err)
+			return 0, nil, nil, fmt.Errorf("tzam: marshal request: %w", err)
 		}
 		rdr = bytes.NewReader(b)
 	}
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.cfg.URL+path, rdr)
 	if err != nil {
-		return fmt.Errorf("tzam: build request: %w", err)
+		return 0, nil, nil, fmt.Errorf("tzam: build request: %w", err)
 	}
 	if body != nil {
 		req.Header.Set("Content-Type", "application/json")
@@ -283,30 +358,23 @@ func (c *Client) post(ctx context.Context, path string, body any, headers http.H
 
 	resp, err := c.http.Do(req)
 	if err != nil {
-		return fmt.Errorf("tzam: %s %s: %w", http.MethodPost, path, err)
+		return 0, nil, nil, fmt.Errorf("tzam: %s %s: %w", http.MethodPost, path, err)
 	}
 	defer resp.Body.Close()
 
-	if resp.StatusCode >= 400 {
-		return decodeAPIError(resp)
+	data, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return resp.StatusCode, nil, resp.Cookies(), fmt.Errorf("tzam: read body: %w", err)
 	}
-
-	if out == nil || resp.StatusCode == http.StatusNoContent {
-		return nil
-	}
-	if err := json.NewDecoder(resp.Body).Decode(out); err != nil {
-		return fmt.Errorf("tzam: decode response: %w", err)
-	}
-	return nil
+	return resp.StatusCode, data, resp.Cookies(), nil
 }
 
-func decodeAPIError(resp *http.Response) error {
+func decodeAPIErrorFromBytes(status int, data []byte) error {
 	var payload struct {
 		Code    string `json:"code"`
 		Message string `json:"message"`
 		Error   string `json:"error"`
 	}
-	data, _ := io.ReadAll(resp.Body)
 	_ = json.Unmarshal(data, &payload)
 
 	msg := payload.Message
@@ -316,5 +384,41 @@ func decodeAPIError(resp *http.Response) error {
 	if msg == "" {
 		msg = strings.TrimSpace(string(data))
 	}
-	return &APIError{Status: resp.StatusCode, Code: payload.Code, Message: msg}
+	return &APIError{Status: status, Code: payload.Code, Message: msg}
+}
+
+// Cookie names the Tzam IdP is known to use for tokens. Accept both
+// snake_case (canonical, set by the Nest backend) and camelCase (defensive,
+// some alt backends in the ecosystem diverge). Session constants in
+// middleware.go (SessionCookie/RefreshCookie) are the names the SDK WRITES
+// to the browser, not the ones the IdP SENDS — intentionally kept separate.
+var (
+	idpAccessCookies  = []string{"access_token", "accessToken"}
+	idpRefreshCookies = []string{"refresh_token", "refreshToken"}
+)
+
+// mergeTokenCookies fills in *access / *refresh from Set-Cookie values
+// when the caller's body-derived field is empty. Body wins on conflict —
+// preserves explicit server response.
+func mergeTokenCookies(access, refresh *string, cookies []*http.Cookie) {
+	if *access == "" {
+		*access = pickCookie(cookies, idpAccessCookies)
+	}
+	if *refresh == "" {
+		*refresh = pickCookie(cookies, idpRefreshCookies)
+	}
+}
+
+func pickCookie(cookies []*http.Cookie, names []string) string {
+	for _, c := range cookies {
+		if c == nil || c.Value == "" {
+			continue
+		}
+		for _, n := range names {
+			if c.Name == n {
+				return c.Value
+			}
+		}
+	}
+	return ""
 }

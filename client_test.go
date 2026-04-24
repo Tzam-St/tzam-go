@@ -77,6 +77,84 @@ func TestLogin_Success(t *testing.T) {
 	}
 }
 
+// TestLogin_TokensFromSetCookie covers the modern Tzam IdP contract where
+// the backend returns tokens only via Set-Cookie (refresh_token is never
+// put in the body for security). Without merging Set-Cookie into the
+// LoginResult, LoginResult.RefreshToken is silently empty and callers
+// that forward the refresh to a browser fail 15 minutes after login when
+// the access token expires.
+func TestLogin_TokensFromSetCookie(t *testing.T) {
+	srv := newMockServer(t, func(w http.ResponseWriter, r *http.Request) {
+		// Modern backend: body carries `accessToken` + user, refresh only via cookie.
+		http.SetCookie(w, &http.Cookie{Name: "access_token", Value: "at-cookie", Path: "/"})
+		http.SetCookie(w, &http.Cookie{Name: "refresh_token", Value: "rt-cookie", Path: "/"})
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"accessToken": "at-cookie",
+			"user":        User{ID: "u1", Email: "a@b", Name: "A"},
+		})
+	})
+	c := NewClient(Config{URL: srv.URL, ClientID: "cid", ClientSecret: "sec"})
+
+	res, err := c.Login(context.Background(), "a@b", "pw")
+	if err != nil {
+		t.Fatalf("Login returned error: %v", err)
+	}
+	if res.AccessToken != "at-cookie" {
+		t.Errorf("AccessToken = %q, want at-cookie", res.AccessToken)
+	}
+	if res.RefreshToken != "rt-cookie" {
+		t.Errorf("RefreshToken = %q, want rt-cookie (from Set-Cookie)", res.RefreshToken)
+	}
+	if res.User.ID != "u1" {
+		t.Errorf("User not decoded: %+v", res.User)
+	}
+}
+
+// TestLogin_BodyTokensWinOverCookie preserves explicit server intent —
+// when the body carries a value, we don't overwrite it with Set-Cookie.
+func TestLogin_BodyTokensWinOverCookie(t *testing.T) {
+	srv := newMockServer(t, func(w http.ResponseWriter, r *http.Request) {
+		http.SetCookie(w, &http.Cookie{Name: "access_token", Value: "at-cookie", Path: "/"})
+		http.SetCookie(w, &http.Cookie{Name: "refresh_token", Value: "rt-cookie", Path: "/"})
+		_ = json.NewEncoder(w).Encode(LoginResult{
+			AccessToken:  "at-body",
+			RefreshToken: "rt-body",
+			User:         User{ID: "u1"},
+		})
+	})
+	c := NewClient(Config{URL: srv.URL})
+
+	res, err := c.Login(context.Background(), "a@b", "pw")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if res.AccessToken != "at-body" || res.RefreshToken != "rt-body" {
+		t.Errorf("body values should win, got access=%q refresh=%q", res.AccessToken, res.RefreshToken)
+	}
+}
+
+// TestRegister_TokensFromSetCookie mirrors TestLogin_TokensFromSetCookie —
+// Register has the same wire shape on the Tzam IdP.
+func TestRegister_TokensFromSetCookie(t *testing.T) {
+	srv := newMockServer(t, func(w http.ResponseWriter, r *http.Request) {
+		http.SetCookie(w, &http.Cookie{Name: "access_token", Value: "at-cookie", Path: "/"})
+		http.SetCookie(w, &http.Cookie{Name: "refresh_token", Value: "rt-cookie", Path: "/"})
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"accessToken": "at-cookie",
+			"user":        User{ID: "u1"},
+		})
+	})
+	c := NewClient(Config{URL: srv.URL, ClientID: "cid", ClientSecret: "sec"})
+
+	res, err := c.Register(context.Background(), "A", "a@b", "pw")
+	if err != nil {
+		t.Fatalf("Register returned error: %v", err)
+	}
+	if res.AccessToken != "at-cookie" || res.RefreshToken != "rt-cookie" {
+		t.Errorf("tokens not merged from Set-Cookie: %+v", res)
+	}
+}
+
 func TestLogin_InvalidCredentialsIsSentinel(t *testing.T) {
 	srv := newMockServer(t, func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusUnauthorized)
@@ -149,6 +227,111 @@ func TestRefreshToken_SendsCookie(t *testing.T) {
 	}
 	if srv.last.cookie != "rt-value" {
 		t.Errorf("refresh_token cookie not forwarded; got %q", srv.last.cookie)
+	}
+}
+
+// TestRefreshSession_BothFromBody — legacy contract where backend returns
+// both tokens in the JSON body. Rare in Tzam but cheap to support.
+func TestRefreshSession_BothFromBody(t *testing.T) {
+	srv := newMockServer(t, func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewEncoder(w).Encode(map[string]string{
+			"accessToken":  "at-body",
+			"refreshToken": "rt-body",
+		})
+	})
+	c := NewClient(Config{URL: srv.URL})
+
+	res, err := c.RefreshSession(context.Background(), "rt-old")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if res.AccessToken != "at-body" {
+		t.Errorf("AccessToken = %q, want at-body", res.AccessToken)
+	}
+	if res.RefreshToken != "rt-body" {
+		t.Errorf("RefreshToken = %q, want rt-body", res.RefreshToken)
+	}
+}
+
+// TestRefreshSession_BothFromCookies — current Tzam IdP contract where
+// tokens come only via Set-Cookie and refresh rotates on every call.
+func TestRefreshSession_BothFromCookies(t *testing.T) {
+	srv := newMockServer(t, func(w http.ResponseWriter, r *http.Request) {
+		http.SetCookie(w, &http.Cookie{Name: "access_token", Value: "at-cookie", Path: "/"})
+		http.SetCookie(w, &http.Cookie{Name: "refresh_token", Value: "rt-rotated", Path: "/"})
+		w.WriteHeader(http.StatusOK)
+		// Body still valid JSON but empty tokens — body carries {} or
+		// {"accessToken":""} depending on backend version.
+		_ = json.NewEncoder(w).Encode(map[string]string{})
+	})
+	c := NewClient(Config{URL: srv.URL})
+
+	res, err := c.RefreshSession(context.Background(), "rt-old")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if res.AccessToken != "at-cookie" {
+		t.Errorf("AccessToken from cookie = %q, want at-cookie", res.AccessToken)
+	}
+	if res.RefreshToken != "rt-rotated" {
+		t.Errorf("RefreshToken from cookie = %q, want rt-rotated", res.RefreshToken)
+	}
+}
+
+// TestRefreshSession_MixedSources — access comes from body (common Tzam
+// response shape) but refresh arrives only via Set-Cookie.
+func TestRefreshSession_MixedSources(t *testing.T) {
+	srv := newMockServer(t, func(w http.ResponseWriter, r *http.Request) {
+		http.SetCookie(w, &http.Cookie{Name: "refresh_token", Value: "rt-rotated", Path: "/"})
+		_ = json.NewEncoder(w).Encode(map[string]string{"accessToken": "at-body"})
+	})
+	c := NewClient(Config{URL: srv.URL})
+
+	res, err := c.RefreshSession(context.Background(), "rt-old")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if res.AccessToken != "at-body" {
+		t.Errorf("AccessToken = %q, want at-body", res.AccessToken)
+	}
+	if res.RefreshToken != "rt-rotated" {
+		t.Errorf("RefreshToken = %q, want rt-rotated (from Set-Cookie)", res.RefreshToken)
+	}
+}
+
+// TestRefreshSession_SendsRefreshCookie sanity — the inbound refresh must
+// be forwarded to /auth/refresh as a Cookie header.
+func TestRefreshSession_SendsRefreshCookie(t *testing.T) {
+	srv := newMockServer(t, func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewEncoder(w).Encode(map[string]string{"accessToken": "at"})
+	})
+	c := NewClient(Config{URL: srv.URL})
+
+	_, err := c.RefreshSession(context.Background(), "rt-old")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if srv.last.cookie != "rt-old" {
+		t.Errorf("refresh_token cookie not forwarded; got %q", srv.last.cookie)
+	}
+}
+
+// TestRefreshToken_DeprecatedWrapper guarantees the old signature still
+// works — callers pinned to v0.4.x surface shouldn't break on upgrade.
+func TestRefreshToken_DeprecatedWrapper(t *testing.T) {
+	srv := newMockServer(t, func(w http.ResponseWriter, r *http.Request) {
+		http.SetCookie(w, &http.Cookie{Name: "access_token", Value: "at-cookie", Path: "/"})
+		http.SetCookie(w, &http.Cookie{Name: "refresh_token", Value: "rt-rotated", Path: "/"})
+		_ = json.NewEncoder(w).Encode(map[string]string{})
+	})
+	c := NewClient(Config{URL: srv.URL})
+
+	at, err := c.RefreshToken(context.Background(), "rt-old")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if at != "at-cookie" {
+		t.Errorf("expected access token from cookie, got %q", at)
 	}
 }
 

@@ -149,10 +149,18 @@ func (p *Proxy) authenticate(w http.ResponseWriter, r *http.Request) *TokenPaylo
 
 	// Attempt refresh when the session is bad but a refresh token exists.
 	if refresh != "" {
-		newAccess, err := p.client.RefreshToken(ctx, refresh)
-		if err == nil && newAccess != "" {
-			if payload, _ := p.client.ValidateToken(ctx, newAccess); payload != nil {
-				p.setSessionCookie(w, newAccess, 15*60)
+		res, err := p.client.RefreshSession(ctx, refresh)
+		if err == nil && res != nil && res.AccessToken != "" {
+			if payload, _ := p.client.ValidateToken(ctx, res.AccessToken); payload != nil {
+				p.setSessionCookie(w, res.AccessToken, 15*60)
+				// Rewrite refresh cookie only when the IdP actually rotated
+				// it. Skipping the no-op rewrite avoids unnecessary
+				// Set-Cookie churn and dodges corner cases where the rewritten
+				// cookie would differ from the browser's original by SameSite
+				// or Secure flags on the same value.
+				if res.RefreshToken != "" && res.RefreshToken != refresh {
+					p.setRefreshCookie(w, res.RefreshToken)
+				}
 				return payload
 			}
 		}
@@ -183,6 +191,26 @@ func (p *Proxy) setSessionCookie(w http.ResponseWriter, token string, maxAgeSeco
 		Secure:   p.secure,
 		SameSite: http.SameSiteLaxMode,
 		MaxAge:   maxAgeSeconds,
+	})
+}
+
+// setRefreshCookie propagates a rotated refresh token from the IdP to the
+// browser. Uses a 7-day MaxAge — matches the Tzam IdP default for
+// non-remembered sessions. When the caller has its own login handler that
+// wrote the initial refresh cookie with a different MaxAge (e.g. 30 days
+// for "remember me"), the rotated cookie here resets to 7 days; callers
+// who need to preserve the original can set the cookie themselves from
+// RefreshSession's return value.
+func (p *Proxy) setRefreshCookie(w http.ResponseWriter, token string) {
+	const sevenDays = 7 * 24 * 60 * 60
+	http.SetCookie(w, &http.Cookie{
+		Name:     RefreshCookie,
+		Value:    token,
+		Path:     p.cookiePath,
+		HttpOnly: true,
+		Secure:   p.secure,
+		SameSite: http.SameSiteLaxMode,
+		MaxAge:   sevenDays,
 	})
 }
 

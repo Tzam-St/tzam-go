@@ -34,10 +34,27 @@ type User struct {
 }
 
 // LoginResult is returned by Login, Register, and VerifyOTP.
+//
+// Modern Tzam backends deliver tokens via Set-Cookie (refresh_token is
+// never in the body for security). The client merges cookie values into
+// this struct when the body field is empty so callers relaying tokens to
+// a browser get consistent results regardless of backend version.
 type LoginResult struct {
 	AccessToken  string `json:"accessToken"`
 	RefreshToken string `json:"refreshToken"`
 	User         User   `json:"user"`
+}
+
+// RefreshResult carries the tokens returned by RefreshSession.
+//
+// AccessToken is always populated on success. RefreshToken is non-empty
+// only when the server rotated it (cookie-rotating IdPs return the new
+// value via Set-Cookie). Callers relaying cookies to a browser should
+// rewrite the refresh cookie only when it's non-empty and differs from
+// the one they sent — see Proxy.Wrap for the canonical pattern.
+type RefreshResult struct {
+	AccessToken  string
+	RefreshToken string
 }
 
 // TokenPayload is the subset of JWT claims the IdP confirms via /auth/validate.
