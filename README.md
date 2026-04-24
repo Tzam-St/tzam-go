@@ -46,7 +46,8 @@ func main() {
 | `Login(ctx, email, password)` | Password login |
 | `Register(ctx, name, email, password)` | App user registration |
 | `ValidateToken(ctx, accessToken)` | Confirm a token is valid (returns `nil, nil` when expired/revoked) |
-| `RefreshToken(ctx, refreshToken)` | Exchange refresh for new access token |
+| `RefreshSession(ctx, refreshToken)` | Exchange refresh for fresh access + rotated refresh (reads body + Set-Cookie) |
+| `RefreshToken(ctx, refreshToken)` | Deprecated: returns access only; loses rotated refresh. Prefer `RefreshSession` |
 | `Logout(ctx, accessToken, refreshToken)` | Revoke the session |
 | `RequestMagicLink(ctx, email, redirect)` | Email a one-time login link |
 | `RequestOTP(ctx, email)` | Email a one-time numeric code |
@@ -111,7 +112,9 @@ Inside protected handlers:
 
 ### Cookies written by the middleware
 
-Only when a refresh succeeds — the middleware writes a new `session` cookie with the refreshed access token. It never writes the `refresh_token` cookie; that is set by the login handler when the session is first established.
+On a successful refresh the middleware writes a new `session` cookie carrying the refreshed access token. When the IdP also rotates the refresh token (returns a new value via `Set-Cookie: refresh_token=...`), the middleware writes the new `refresh_token` cookie too — required for backends that invalidate refresh tokens on use. When the IdP does not rotate, the browser's existing `refresh_token` cookie is left untouched.
+
+The initial `session` and `refresh_token` cookies are still written by your login handler when the session is first established — call `Client.Login` (or `Register`, `VerifyOTP`) and set both cookies from the returned `LoginResult`. Starting in this release those tokens are merged from `Set-Cookie` when the IdP omits them from the body, so the same code path works whether the backend delivers tokens in the body or via cookies.
 
 ## Framework adapters
 

@@ -139,6 +139,125 @@ func TestProxy_ExpiredSessionTriggersRefresh(t *testing.T) {
 	}
 }
 
+// TestProxy_RefreshRotation_RewritesBothCookies — when the IdP rotates
+// the refresh token (common Tzam config for single-use refreshes), the
+// proxy must write BOTH session AND refresh cookies back to the browser.
+// Otherwise the browser keeps the old (now-consumed) refresh and the next
+// /auth/refresh fails, causing a redirect loop to /auth/login ~15 min
+// after a successful login.
+func TestProxy_RefreshRotation_RewritesBothCookies(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/auth/validate":
+			tok := r.Header.Get("Authorization")
+			if len(tok) > 7 {
+				tok = tok[7:]
+			}
+			if tok == "fresh" {
+				_ = json.NewEncoder(w).Encode(TokenPayload{UserID: "u1", Email: "a@b"})
+				return
+			}
+			w.WriteHeader(http.StatusUnauthorized)
+		case "/auth/refresh":
+			// Rotating-refresh IdP: body has accessToken, Set-Cookie rotates refresh.
+			http.SetCookie(w, &http.Cookie{Name: "refresh_token", Value: "rt-new", Path: "/"})
+			_ = json.NewEncoder(w).Encode(map[string]string{"accessToken": "fresh"})
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer srv.Close()
+
+	proxy := NewProxy(ProxyConfig{Config: Config{URL: srv.URL}})
+	handler := proxy.Wrap(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte("ok"))
+	}))
+
+	req := httptest.NewRequest(http.MethodGet, "/dashboard", nil)
+	req.AddCookie(&http.Cookie{Name: SessionCookie, Value: "stale"})
+	req.AddCookie(&http.Cookie{Name: RefreshCookie, Value: "rt-old"})
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %q", rec.Code, rec.Body.String())
+	}
+
+	var gotSession, gotRefresh string
+	for _, c := range rec.Result().Cookies() {
+		if c.Name == SessionCookie && c.MaxAge > 0 {
+			gotSession = c.Value
+		}
+		if c.Name == RefreshCookie && c.MaxAge > 0 {
+			gotRefresh = c.Value
+		}
+	}
+	if gotSession != "fresh" {
+		t.Errorf("session cookie = %q, want 'fresh'", gotSession)
+	}
+	if gotRefresh != "rt-new" {
+		t.Errorf("refresh cookie = %q, want 'rt-new' (rotation must be propagated)", gotRefresh)
+	}
+}
+
+// TestProxy_RefreshRotation_NoRotation_OnlySessionRewritten — when the
+// IdP does NOT rotate the refresh, the proxy must leave the refresh
+// cookie alone (otherwise a Set-Cookie with the same value + SameSite/
+// Secure flags can mismatch the original and trip browsers).
+func TestProxy_RefreshRotation_NoRotation_OnlySessionRewritten(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/auth/validate":
+			tok := r.Header.Get("Authorization")
+			if len(tok) > 7 {
+				tok = tok[7:]
+			}
+			if tok == "fresh" {
+				_ = json.NewEncoder(w).Encode(TokenPayload{UserID: "u1", Email: "a@b"})
+				return
+			}
+			w.WriteHeader(http.StatusUnauthorized)
+		case "/auth/refresh":
+			// Non-rotating IdP: only access token comes back, refresh is untouched.
+			_ = json.NewEncoder(w).Encode(map[string]string{"accessToken": "fresh"})
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer srv.Close()
+
+	proxy := NewProxy(ProxyConfig{Config: Config{URL: srv.URL}})
+	handler := proxy.Wrap(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte("ok"))
+	}))
+
+	req := httptest.NewRequest(http.MethodGet, "/dashboard", nil)
+	req.AddCookie(&http.Cookie{Name: SessionCookie, Value: "stale"})
+	req.AddCookie(&http.Cookie{Name: RefreshCookie, Value: "rt-kept"})
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d", rec.Code)
+	}
+
+	var sessionSet, refreshSet bool
+	for _, c := range rec.Result().Cookies() {
+		if c.Name == SessionCookie && c.MaxAge > 0 {
+			sessionSet = true
+		}
+		if c.Name == RefreshCookie && c.MaxAge > 0 {
+			refreshSet = true
+		}
+	}
+	if !sessionSet {
+		t.Error("expected session cookie to be rewritten")
+	}
+	if refreshSet {
+		t.Error("refresh cookie should NOT be rewritten when IdP did not rotate")
+	}
+}
+
 func TestProxy_RedirectsWhenNoCookies(t *testing.T) {
 	srv := idpStub(t, nil, nil)
 	defer srv.Close()
